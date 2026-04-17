@@ -1,4 +1,5 @@
 #include "op/mha.h"
+#include "base/profiler.h"
 #include "kernels/cpu/mha_kernel.h"
 #include "kernels/kernels_interface.h"
 namespace op {
@@ -30,6 +31,7 @@ base::Status MultiHeadAttention::forward() {
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
     CHECK(cuda_config_ != nullptr);
   }
+  base::ScopedCudaProfile profile("MHA", cuda_config_ ? cuda_config_->stream : nullptr);
   kernel::get_mha_kernel(device_type_)(pos_, head_num_, layer_index_, seq_len_, kv_dim_, kv_mul_,
                                        head_size_, mha_out, query_tensor, score_tensor,
                                        key_cache_tensor, value_cache_tensor, device_type_,

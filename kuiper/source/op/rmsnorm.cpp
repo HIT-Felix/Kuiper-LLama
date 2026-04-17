@@ -1,6 +1,7 @@
 #include "op/rmsnorm.h"
 #include <cuda_runtime_api.h>
 #include <armadillo>
+#include "base/profiler.h"
 #include "kernels/cpu/rmsnorm_kernel.h"
 #include "kernels/kernels_interface.h"
 namespace op {
@@ -23,9 +24,11 @@ base::Status RmsNormLayer::forward() {
     CHECK(cuda_config_ != nullptr);
   }
   if (input.dims_size() == 1) {
+    base::ScopedCudaProfile profile("RMSNorm", cuda_config_ ? cuda_config_->stream : nullptr);
     kernel::get_rmsnorm_kernel(device_type_)(input, weight, output,
                                              cuda_config_ ? cuda_config_->stream : nullptr);
   } else {
+    base::ScopedCudaProfile profile("RMSNormDim", cuda_config_ ? cuda_config_->stream : nullptr);
     kernel::get_rmsnorm_dim_kernel(device_type_)(input, weight, output, dim_,
                                                  cuda_config_ ? cuda_config_->stream : nullptr);
   }

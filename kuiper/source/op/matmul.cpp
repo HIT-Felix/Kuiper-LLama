@@ -1,4 +1,5 @@
 #include "op/matmul.h"
+#include "base/profiler.h"
 #include "kernels/cpu/matmul_kernel.h"
 #include "kernels/kernels_interface.h"
 namespace op {
@@ -62,6 +63,8 @@ base::Status MatmulLayer::forward() {
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
     CHECK(cuda_config_ != nullptr);
   }
+  base::ScopedCudaProfile profile(is_quant_layer_ ? "MatmulInt8" : "Matmul",
+                                  cuda_config_ ? cuda_config_->stream : nullptr);
   if (is_quant_layer_) {
     kernel::get_matmul_kernel_quant8(device_type_)(get_input(0), get_weight(0), get_output(0),
                                                    group_size_, scales_,

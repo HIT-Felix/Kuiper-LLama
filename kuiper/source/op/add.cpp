@@ -1,4 +1,5 @@
 #include "op/add.h"
+#include "base/profiler.h"
 #include "kernels/kernels_interface.h"
 namespace op {
 VecAddLayer::VecAddLayer(base::DeviceType device_type)
@@ -43,6 +44,7 @@ base::Status VecAddLayer::forward() {
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
     CHECK(cuda_config_ != nullptr);
   }
+  base::ScopedCudaProfile profile("Add", cuda_config_ ? cuda_config_->stream : nullptr);
   kernel::get_add_kernel(device_type_)(input1, input2, output,
                                        cuda_config_ ? cuda_config_->stream : nullptr);
   return base::error::Success();

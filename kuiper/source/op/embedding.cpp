@@ -1,4 +1,5 @@
 #include "op/embedding.h"
+#include "base/profiler.h"
 #include "kernels/cpu/emb_kernel.h"
 #include "kernels/kernels_interface.h"
 #include "op/layer.h"
@@ -50,6 +51,7 @@ base::Status EmbeddingLayer::forward() {
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
     CHECK(cuda_config_ != nullptr);
   }
+  base::ScopedCudaProfile profile("Embedding", cuda_config_ ? cuda_config_->stream : nullptr);
   kernel::get_emb_kernel(device_type_)(get_input(0), get_weight(0), get_output(0), vocab_size_,
                                        cuda_config_ ? cuda_config_->stream : nullptr);
   return base::StatusCode::kSuccess;

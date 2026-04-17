@@ -1,5 +1,6 @@
 #include "op/rope.h"
 #include <cmath>
+#include "base/profiler.h"
 #include "kernels/cpu/rope_kernel.h"
 #include "kernels/kernels_interface.h"
 namespace op {
@@ -28,6 +29,7 @@ base::Status RoPELayer::forward() {
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
     CHECK(cuda_config_ != nullptr);
   }
+  base::ScopedCudaProfile profile("RoPE", cuda_config_ ? cuda_config_->stream : nullptr);
   kernel::get_rope_kernel(device_type_)(dim_, kv_dim_, head_size_, input_q, input_k, input_pos,
                                         sin_cache, cos_cache,
                                         cuda_config_ ? cuda_config_->stream : nullptr);
