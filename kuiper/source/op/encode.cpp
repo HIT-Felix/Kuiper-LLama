@@ -1,7 +1,4 @@
 #include <sentencepiece_processor.h>
-#if defined(LLAMA3_SUPPORT) || defined(QWEN2_SUPPORT) || defined(QWEN3_SUPPORT)
-#include <absl/strings/str_replace.h>
-#endif
 #include "op/encode.h"
 #include <glog/logging.h>
 #include "base/unicode.h"
@@ -65,6 +62,20 @@ int32_t SpeEncodeLayer::vocab_size() const {
 static const std::string PAT_STR =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?:$|[^\S])|\s+)";
 
+namespace {
+std::string replace_all_copy(std::string text, const std::string& from, const std::string& to) {
+  if (from.empty()) {
+    return text;
+  }
+  size_t pos = 0;
+  while ((pos = text.find(from, pos)) != std::string::npos) {
+    text.replace(pos, from.size(), to);
+    pos += to.size();
+  }
+  return text;
+}
+}  // namespace
+
 BpeEncodeLayer::BpeEncodeLayer(std::string token_model_path, bool has_bos, bool has_eos)
     : EncodeLayerBase(std::move(token_model_path), has_bos, has_eos) {
   using json = nlohmann::json;
@@ -111,9 +122,7 @@ BpeEncodeLayer::BpeEncodeLayer(std::string token_model_path, bool has_bos, bool 
 
 std::vector<int32_t> BpeEncodeLayer::encode(const std::string& sentence) const {
   CHECK(this->tiktoken_ != nullptr);
-  std::map<std::string, std::string> replacements;
-  replacements[" "] = "Ġ";
-  std::string s = absl::StrReplaceAll(sentence, replacements);
+  std::string s = replace_all_copy(sentence, " ", "Ġ");
   auto input_ids = this->tiktoken_->encode(s);
 
   if (has_bos_) {
@@ -130,9 +139,7 @@ std::string BpeEncodeLayer::decode(int32_t token_id) const { return ""; }
 std::string BpeEncodeLayer::decode(const std::vector<int32_t>& token_ids) const {
   CHECK(this->tiktoken_ != nullptr);
   auto s = tiktoken_->decode(token_ids);
-  std::map<std::string, std::string> reverse_replacements;
-  reverse_replacements["Ġ"] = " ";
-  const std::string& sentence = absl::StrReplaceAll(s, reverse_replacements);
+  std::string sentence = replace_all_copy(s, "Ġ", " ");
   return sentence;
 }
 
