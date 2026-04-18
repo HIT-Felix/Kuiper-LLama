@@ -8,7 +8,6 @@
 #include "op/layer.h"
 #include "raw_model_data.h"
 #include "sampler/argmax_sampler.h"
-#include "sentencepiece_processor.h"
 #include "tensor/tensor.h"
 
 namespace model {

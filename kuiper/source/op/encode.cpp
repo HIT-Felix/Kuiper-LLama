@@ -1,4 +1,5 @@
 #include "op/encode.h"
+#include <sentencepiece_processor.h>
 #include <glog/logging.h>
 #include "base/unicode.h"
 namespace op {
@@ -20,6 +21,8 @@ std::string SpeEncodeLayer::decode(const std::vector<int32_t>& token_ids) const 
   CHECK(spe != nullptr);
   return this->spe->DecodeIds(token_ids);
 }
+
+SpeEncodeLayer::~SpeEncodeLayer() = default;
 
 SpeEncodeLayer::SpeEncodeLayer(std::string token_model_path, bool has_bos, bool has_eos)
     : EncodeLayerBase(std::move(token_model_path), has_bos, has_eos) {

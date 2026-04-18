@@ -1,6 +1,5 @@
 #ifndef KUIPER_INCLUDE_OP_ENCODE_H_
 #define KUIPER_INCLUDE_OP_ENCODE_H_
-#include <sentencepiece_processor.h>
 #include "layer.h"
 #if defined (LLAMA3_SUPPORT) || defined (QWEN2_SUPPORT) || defined (QWEN3_SUPPORT)
 #include <absl/strings/str_join.h>
@@ -10,6 +9,11 @@
 #include "base/unordered_dense.h"
 #include "nlohmann/json.hpp"
 #endif
+
+namespace sentencepiece {
+class SentencePieceProcessor;
+}
+
 namespace op {
 
 class EncodeLayerBase : public Layer {
@@ -39,6 +43,7 @@ class EncodeLayerBase : public Layer {
 class SpeEncodeLayer : public EncodeLayerBase {
  public:
   explicit SpeEncodeLayer(std::string token_model_path, bool has_bos, bool has_eos);
+  ~SpeEncodeLayer() override;
 
   std::vector<int32_t> encode(const std::string& sentence) const override;
 
