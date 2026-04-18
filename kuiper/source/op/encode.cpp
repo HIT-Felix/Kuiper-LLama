@@ -1,5 +1,8 @@
-#include "op/encode.h"
 #include <sentencepiece_processor.h>
+#if defined(LLAMA3_SUPPORT) || defined(QWEN2_SUPPORT) || defined(QWEN3_SUPPORT)
+#include <absl/strings/str_replace.h>
+#endif
+#include "op/encode.h"
 #include <glog/logging.h>
 #include "base/unicode.h"
 namespace op {
@@ -86,7 +89,7 @@ BpeEncodeLayer::BpeEncodeLayer(std::string token_model_path, bool has_bos, bool 
 
   ankerl::unordered_dense::map<std::string, int> encoder;
   const auto& vocabs = data["model"]["vocab"];
-  const auto& vocab_items = vocabs.items();
+  auto vocab_items = vocabs.items();
   for (const auto& v : vocab_items) {
     const auto cpts = unicode_cpts_from_utf8(v.key());
     std::string key;
@@ -162,7 +165,7 @@ QwenEncodeLayer::QwenEncodeLayer(std::string token_model_path, bool has_bos, boo
 
   ankerl::unordered_dense::map<std::string, int> encoder;
   const auto& vocabs = data["model"]["vocab"];
-  const auto& vocab_items = vocabs.items();
+  auto vocab_items = vocabs.items();
   for (const auto& v : vocab_items) {
     const auto cpts = unicode_cpts_from_utf8(v.key());
     std::string key;
