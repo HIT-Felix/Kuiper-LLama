@@ -123,8 +123,11 @@ void CudaProfiler::Report() const {
 }
 
 ScopedCudaProfile::ScopedCudaProfile(const char* name, cudaStream_t stream)
-    : name_(name), stream_(stream) {
-  if (!name_ || !CudaProfiler::GetInstance().enabled()) {
+    : ScopedCudaProfile(name ? std::string(name) : std::string(), stream) {}
+
+ScopedCudaProfile::ScopedCudaProfile(std::string name, cudaStream_t stream)
+    : name_(std::move(name)), stream_(stream) {
+  if (name_.empty() || !CudaProfiler::GetInstance().enabled()) {
     return;
   }
 

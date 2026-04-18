@@ -1,6 +1,7 @@
 #include "model/llama3.h"
 #include <cuda_runtime_api.h>
 #include <glog/logging.h>
+#include <string>
 #include <op/matmul.h>
 #include <op/mha.h>
 #include <op/rmsnorm.h>
@@ -8,8 +9,15 @@
 #include <utility>
 #include "../op/kernels/cpu/rope_kernel.h"
 #include "../op/kernels/cuda/rope_kernel.cuh"
+#include "base/profiler.h"
 #include "base/tick.h"
 namespace model {
+
+namespace {
+std::string layer_profile_name(const char* model_name, const char* stage, int32_t layer_idx) {
+  return std::string(model_name) + "_L" + std::to_string(layer_idx) + "_" + stage;
+}
+}  // namespace
 
 void LLama2Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
   if (add_layer_) {
@@ -599,6 +607,8 @@ op::EmbeddingOutput LLama2Model::embedding(const std::vector<int>& tokens) const
 
 void LLama2Model::attention_rms(int32_t layer_idx, const tensor::Tensor& input) const {
   CHECK(llama_layers_ != nullptr);
+  base::ScopedCudaProfile profile(layer_profile_name("LLaMA", "AttnRMS", layer_idx),
+                                  cuda_config_ ? cuda_config_->stream : nullptr);
   // attn rmsnorm
   tensor::Tensor rmsnorm_output = get_buffer(ModelBufferType::kOutputRMSNorm);
   std::shared_ptr<op::Layer> rmsnorm_layer = llama_layers_->rmsnorm_layers_.at(layer_idx);
@@ -610,6 +620,8 @@ void LLama2Model::attention_rms(int32_t layer_idx, const tensor::Tensor& input) 
 
 void LLama2Model::attention_qkv(int32_t layer_idx, const tensor::Tensor& pos_tensor) const {
   CHECK(llama_layers_ != nullptr);
+  base::ScopedCudaProfile profile(layer_profile_name("LLaMA", "QKV", layer_idx),
+                                  cuda_config_ ? cuda_config_->stream : nullptr);
   // kv cache
   tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
   int32_t pos = pos_tensor.index<int32_t>(0);
@@ -651,6 +663,8 @@ base::Status LLama2Model::predict(const tensor::Tensor& input, const tensor::Ten
 
 void LLama2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_tensor) const {
   CHECK(llama_layers_ != nullptr);
+  base::ScopedCudaProfile profile(layer_profile_name("LLaMA", "MHA", layer_idx),
+                                  cuda_config_ ? cuda_config_->stream : nullptr);
   // mha
   tensor::Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
   // VAL = [val1,val2,...val t]
@@ -677,6 +691,8 @@ void LLama2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_ten
 
 void LLama2Model::feed_forward(int32_t layer_idx, const tensor::Tensor& input) const {
   CHECK(llama_layers_ != nullptr);
+  base::ScopedCudaProfile profile(layer_profile_name("LLaMA", "FFN", layer_idx),
+                                  cuda_config_ ? cuda_config_->stream : nullptr);
   // residual add
   CHECK_NE(llama_layers_->add_layer_, nullptr)
       << "The add layer in the feedforward block is null pointer";

@@ -30,10 +30,11 @@ class CudaProfiler {
 class ScopedCudaProfile {
  public:
   ScopedCudaProfile(const char* name, cudaStream_t stream);
+  ScopedCudaProfile(std::string name, cudaStream_t stream);
   ~ScopedCudaProfile();
 
  private:
-  const char* name_ = nullptr;
+  std::string name_;
   bool active_ = false;
   bool events_created_ = false;
   cudaEvent_t start_{};

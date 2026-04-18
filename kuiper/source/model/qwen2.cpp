@@ -1,6 +1,7 @@
 #include "model/qwen2.h"
 #include <cuda_runtime_api.h>
 #include <glog/logging.h>
+#include <string>
 #include <op/matmul.h>
 #include <op/mha.h>
 #include <op/rmsnorm.h>
@@ -8,8 +9,15 @@
 #include <utility>
 #include "../op/kernels/cpu/rope_kernel.h"
 #include "../op/kernels/cuda/rope_kernel.cuh"
+#include "base/profiler.h"
 #include "base/tick.h"
 namespace model {
+
+namespace {
+std::string layer_profile_name(const char* model_name, const char* stage, int32_t layer_idx) {
+  return std::string(model_name) + "_L" + std::to_string(layer_idx) + "_" + stage;
+}
+}  // namespace
 
 void Qwen2Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
   if (add_layer_) {
@@ -581,6 +589,8 @@ base::Status Qwen2Model::create_layers() {
 
 void Qwen2Model::attention_rms(int32_t layer_idx, const tensor::Tensor& input) const {
   CHECK(qwen_layers_ != nullptr);
+  base::ScopedCudaProfile profile(layer_profile_name("Qwen2", "AttnRMS", layer_idx),
+                                  cuda_config_ ? cuda_config_->stream : nullptr);
   // attn rmsnorm
   tensor::Tensor rmsnorm_output = get_buffer(ModelBufferType::kOutputRMSNorm);
   std::shared_ptr<op::Layer> rmsnorm_layer = qwen_layers_->rmsnorm_layers_.at(layer_idx);
@@ -592,6 +602,8 @@ void Qwen2Model::attention_rms(int32_t layer_idx, const tensor::Tensor& input) c
 
 void Qwen2Model::attention_qkv(int32_t layer_idx, const tensor::Tensor& pos_tensor) const {
   CHECK(qwen_layers_ != nullptr);
+  base::ScopedCudaProfile profile(layer_profile_name("Qwen2", "QKV", layer_idx),
+                                  cuda_config_ ? cuda_config_->stream : nullptr);
   // kv cache
   tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
   int32_t pos = pos_tensor.index<int32_t>(0);
@@ -633,6 +645,8 @@ base::Status Qwen2Model::predict(const tensor::Tensor& input, const tensor::Tens
 
 void Qwen2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_tensor) const {
   CHECK(qwen_layers_ != nullptr);
+  base::ScopedCudaProfile profile(layer_profile_name("Qwen2", "MHA", layer_idx),
+                                  cuda_config_ ? cuda_config_->stream : nullptr);
   // mha
   tensor::Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
   // VAL = [val1,val2,...val t]
@@ -659,6 +673,8 @@ void Qwen2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_tens
 
 void Qwen2Model::feed_forward(int32_t layer_idx, const tensor::Tensor& input) const {
   CHECK(qwen_layers_ != nullptr);
+  base::ScopedCudaProfile profile(layer_profile_name("Qwen2", "FFN", layer_idx),
+                                  cuda_config_ ? cuda_config_->stream : nullptr);
   // residual add
   CHECK_NE(qwen_layers_->add_layer_, nullptr)
       << "The add layer in the feedforward block is null pointer";
