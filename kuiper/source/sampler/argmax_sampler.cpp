@@ -8,7 +8,7 @@ size_t ArgmaxSampler::sample(const float* logits, size_t size, void* stream) {
     size_t next = std::distance(logits, std::max_element(logits, logits + size));
     return next;
   } else {
-    base::ScopedCudaProfile profile("Argmax", stream);
+    base::ScopedCudaProfile profile("Argmax", reinterpret_cast<cudaStream_t>(stream));
     size_t next = kernel::argmax_kernel_cu(logits, size, stream);
     return next;
   }
