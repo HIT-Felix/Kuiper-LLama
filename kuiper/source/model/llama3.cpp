@@ -32,13 +32,13 @@ tensor::Tensor make_tensor_view(const tensor::Tensor& tensor, int64_t offset, in
 void copy_tensor_data(const tensor::Tensor& src, const tensor::Tensor& dst, void* stream = nullptr) {
   CHECK(!src.is_empty());
   CHECK(!dst.is_empty());
-  CHECK_EQ(src.size(), dst.size());
-  CHECK_EQ(src.data_type(), dst.data_type());
+  CHECK(src.size() == dst.size());
+  CHECK(src.data_type() == dst.data_type());
 
   const auto src_device = src.device_type();
   const auto dst_device = dst.device_type();
-  CHECK_NE(src_device, base::DeviceType::kDeviceUnknown);
-  CHECK_NE(dst_device, base::DeviceType::kDeviceUnknown);
+  CHECK(src_device != base::DeviceType::kDeviceUnknown);
+  CHECK(dst_device != base::DeviceType::kDeviceUnknown);
 
   base::MemcpyKind kind = base::MemcpyKind::kMemcpyCPU2CPU;
   if (src_device == base::DeviceType::kDeviceCPU && dst_device == base::DeviceType::kDeviceCUDA) {
@@ -56,7 +56,8 @@ void copy_tensor_data(const tensor::Tensor& src, const tensor::Tensor& dst, void
                              base::CUDADeviceAllocatorFactory::get_instance())
                        : std::static_pointer_cast<base::DeviceAllocator>(
                              base::CPUDeviceAllocatorFactory::get_instance());
-  allocator->memcpy(src.ptr<float>(), dst.ptr<float>(), src.byte_size(), kind, stream);
+  allocator->memcpy(src.ptr<float>(), const_cast<float*>(dst.ptr<float>()), src.byte_size(), kind,
+                    stream);
 }
 }  // namespace
 
