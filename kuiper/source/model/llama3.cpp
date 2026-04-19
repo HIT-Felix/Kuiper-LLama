@@ -384,7 +384,9 @@ void LLama2Model::create_param_layers() {
     std::memcpy(fused_ptr, w1_ptr, matmul_size * sizeof(float));
     std::memcpy(fused_ptr + matmul_size, w3_ptr, matmul_size * sizeof(float));
 
-    gate_up->set_weight(0, fused_weight);
+    llama_layers_->gate_up_weights_.push_back(fused_weight);
+    gate_up->set_weight(0, {hidden_dim * 2, dim},
+                        llama_layers_->gate_up_weights_.back().ptr<float>(), cpu_device_type);
     llama_layers_->gate_up_layers_.push_back(gate_up);
   }
 
