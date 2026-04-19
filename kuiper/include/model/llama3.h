@@ -14,14 +14,14 @@ struct LLama2Layers {
   std::shared_ptr<op::Layer> swiglu_layer_;
   std::shared_ptr<op::Layer> mha_layer_;
 
+  std::vector<std::shared_ptr<op::Layer>> qkv_layers_;
+  std::vector<tensor::Tensor> qkv_weights_;
   std::vector<std::shared_ptr<op::Layer>> wq_layers_;
   std::vector<std::shared_ptr<op::Layer>> wk_layers_;
   std::vector<std::shared_ptr<op::Layer>> wv_layers_;
   std::vector<std::shared_ptr<op::Layer>> wo_layers_;
 
   std::vector<std::shared_ptr<op::Layer>> w1_layers_;
-  std::vector<std::shared_ptr<op::Layer>> gate_up_layers_;
-  std::vector<tensor::Tensor> gate_up_weights_;
   std::vector<std::shared_ptr<op::Layer>> w2_layers_;
   std::vector<std::shared_ptr<op::Layer>> rmsnorm_layers_;
   std::vector<std::shared_ptr<op::Layer>> w3_layers_;
