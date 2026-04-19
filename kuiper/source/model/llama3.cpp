@@ -1,6 +1,5 @@
 #include "model/llama3.h"
 #include <cuda_runtime_api.h>
-#include <cstring>
 #include <glog/logging.h>
 #include <string>
 #include <op/matmul.h>
@@ -16,48 +15,6 @@ namespace model {
 namespace {
 std::string layer_profile_name(const char* model_name, const char* stage, int32_t layer_idx) {
   return std::string(model_name) + "_L" + std::to_string(layer_idx) + "_" + stage;
-}
-
-tensor::Tensor make_tensor_view(const tensor::Tensor& tensor, int64_t offset, int32_t dim0) {
-  CHECK_GE(offset, 0);
-  CHECK_LE(offset + dim0, static_cast<int64_t>(tensor.size()));
-  auto buffer = std::make_shared<base::Buffer>(dim0 * sizeof(float), nullptr,
-                                               const_cast<float*>(tensor.ptr<float>(offset)), true);
-  buffer->set_device_type(tensor.device_type());
-  tensor::Tensor view(base::DataType::kDataTypeFp32, dim0);
-  CHECK(view.assign(buffer));
-  return view;
-}
-
-void copy_tensor_data(const tensor::Tensor& src, const tensor::Tensor& dst, void* stream = nullptr) {
-  CHECK(!src.is_empty());
-  CHECK(!dst.is_empty());
-  CHECK(src.size() == dst.size());
-  CHECK(src.data_type() == dst.data_type());
-
-  const auto src_device = src.device_type();
-  const auto dst_device = dst.device_type();
-  CHECK(src_device != base::DeviceType::kDeviceUnknown);
-  CHECK(dst_device != base::DeviceType::kDeviceUnknown);
-
-  base::MemcpyKind kind = base::MemcpyKind::kMemcpyCPU2CPU;
-  if (src_device == base::DeviceType::kDeviceCPU && dst_device == base::DeviceType::kDeviceCUDA) {
-    kind = base::MemcpyKind::kMemcpyCPU2CUDA;
-  } else if (src_device == base::DeviceType::kDeviceCUDA &&
-             dst_device == base::DeviceType::kDeviceCPU) {
-    kind = base::MemcpyKind::kMemcpyCUDA2CPU;
-  } else if (src_device == base::DeviceType::kDeviceCUDA &&
-             dst_device == base::DeviceType::kDeviceCUDA) {
-    kind = base::MemcpyKind::kMemcpyCUDA2CUDA;
-  }
-
-  auto allocator = dst_device == base::DeviceType::kDeviceCUDA
-                       ? std::static_pointer_cast<base::DeviceAllocator>(
-                             base::CUDADeviceAllocatorFactory::get_instance())
-                       : std::static_pointer_cast<base::DeviceAllocator>(
-                             base::CPUDeviceAllocatorFactory::get_instance());
-  allocator->memcpy(src.ptr<float>(), const_cast<float*>(dst.ptr<float>()), src.byte_size(), kind,
-                    stream);
 }
 }  // namespace
 
@@ -90,13 +47,6 @@ void LLama2Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
   if (mha_layer_) {
     mha_layer_->set_cuda_config(config);
     mha_layer_->to_cuda();
-  }
-
-  for (auto& weight_layer : qkv_layers_) {
-    if (weight_layer) {
-      weight_layer->set_cuda_config(config);
-      weight_layer->to_cuda();
-    }
   }
 
   for (auto& weight_layer : wq_layers_) {
@@ -359,38 +309,29 @@ void LLama2Model::create_param_layers() {
   // create all matmul layer
   int32_t dim = config_->dim_;
   size_t pos = dim * std::abs(config_->vocab_size_) + dim * config_->layer_num_;
-  const size_t q_matmul_size = static_cast<size_t>(dim) * dim;
-  const size_t kv_matmul_size = static_cast<size_t>(config_->kv_dim_) * dim;
-  const size_t wq_base = pos;
-  const size_t wk_base = wq_base + static_cast<size_t>(config_->layer_num_) * q_matmul_size;
-  const size_t wv_base = wk_base + static_cast<size_t>(config_->layer_num_) * kv_matmul_size;
-  const size_t wo_base = wv_base + static_cast<size_t>(config_->layer_num_) * kv_matmul_size;
-
-  // fused qkv layers
+  // create weight matrix for query
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto qkv = std::make_shared<op::MatmulLayer>(device_type_, dim + 2 * config_->kv_dim_, dim);
-    tensor::Tensor fused_weight(base::DataType::kDataTypeFp32, dim + 2 * config_->kv_dim_, dim,
-                                true, base::CPUDeviceAllocatorFactory::get_instance());
-    fused_weight.set_device_type(cpu_device_type);
-
-    float* fused_ptr = fused_weight.ptr<float>();
-    const float* wq_ptr = reinterpret_cast<const float*>(
-        this->raw_model_data_->weight(wq_base + static_cast<size_t>(i) * q_matmul_size));
-    const float* wk_ptr = reinterpret_cast<const float*>(
-        this->raw_model_data_->weight(wk_base + static_cast<size_t>(i) * kv_matmul_size));
-    const float* wv_ptr = reinterpret_cast<const float*>(
-        this->raw_model_data_->weight(wv_base + static_cast<size_t>(i) * kv_matmul_size));
-    std::memcpy(fused_ptr, wq_ptr, q_matmul_size * sizeof(float));
-    std::memcpy(fused_ptr + q_matmul_size, wk_ptr, kv_matmul_size * sizeof(float));
-    std::memcpy(fused_ptr + q_matmul_size + kv_matmul_size, wv_ptr,
-                kv_matmul_size * sizeof(float));
-
-    llama_layers_->qkv_weights_.push_back(fused_weight);
-    qkv->set_weight(0, {dim + 2 * config_->kv_dim_, dim},
-                    llama_layers_->qkv_weights_.back().ptr<float>(), cpu_device_type);
-    llama_layers_->qkv_layers_.push_back(qkv);
+    auto wq = std::make_shared<op::MatmulLayer>(device_type_, dim, dim);
+    wq->set_weight(0, {dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    llama_layers_->wq_layers_.push_back(wq);
+    pos += dim * dim;
   }
-  pos = wo_base;
+
+  // create weight matrix for key
+  for (int32_t i = 0; i < config_->layer_num_; ++i) {
+    auto wk = std::make_shared<op::MatmulLayer>(device_type_, config_->kv_dim_, dim);
+    wk->set_weight(0, {config_->kv_dim_, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    llama_layers_->wk_layers_.push_back(wk);
+    pos += config_->kv_dim_ * dim;
+  }
+
+  // create weight matrix for value
+  for (int32_t i = 0; i < config_->layer_num_; ++i) {
+    auto wv = std::make_shared<op::MatmulLayer>(device_type_, config_->kv_dim_, dim);
+    wv->set_weight(0, {config_->kv_dim_, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    llama_layers_->wv_layers_.push_back(wv);
+    pos += config_->kv_dim_ * dim;
+  }
 
   // create weight matrix for output
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
@@ -524,9 +465,6 @@ void LLama2Model::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kOutputMHA, rms_output));
   CHECK(insert_buffer(ModelBufferType::kW2Output, rms_output));
   CHECK(insert_buffer(ModelBufferType::kFFNRMSNorm, rms_output));
-  tensor::Tensor qkv_output(base::DataType::kDataTypeFp32, config_->dim_ + 2 * config_->kv_dim_,
-                            true, alloc);
-  CHECK(insert_buffer(ModelBufferType::kQKVOutput, qkv_output));
 
   tensor::Tensor w1_output(base::DataType::kDataTypeFp32, config_->hidden_dim_, true, alloc);
   tensor::Tensor w3_output(base::DataType::kDataTypeFp32, config_->hidden_dim_, true, alloc);
@@ -589,11 +527,10 @@ base::Status LLama2Model::create_layers() {
     return error::InternalError("Create the rmsnorm layers for the llama model failed!");
   }
 
-  const bool has_fused_qkv = llama_layers_->qkv_layers_.size() == config_->layer_num_;
-  const bool has_split_qkv = llama_layers_->wq_layers_.size() == config_->layer_num_ &&
-                             llama_layers_->wk_layers_.size() == config_->layer_num_ &&
-                             llama_layers_->wv_layers_.size() == config_->layer_num_;
-  if ((!has_fused_qkv && !has_split_qkv) || llama_layers_->wo_layers_.size() != config_->layer_num_) {
+  if (llama_layers_->wq_layers_.size() != config_->layer_num_ ||
+      llama_layers_->wk_layers_.size() != config_->layer_num_ ||
+      llama_layers_->wv_layers_.size() != config_->layer_num_ ||
+      llama_layers_->wo_layers_.size() != config_->layer_num_) {
     return error::InternalError(
         "Create the matmul layer in the attention and ffn attention layers for "
         "the llama model "
@@ -601,11 +538,8 @@ base::Status LLama2Model::create_layers() {
   }
 
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    const bool valid_fused_qkv = has_fused_qkv && llama_layers_->qkv_layers_.at(i);
-    const bool valid_split_qkv =
-        has_split_qkv && llama_layers_->wq_layers_.at(i) && llama_layers_->wk_layers_.at(i) &&
-        llama_layers_->wv_layers_.at(i);
-    if ((!valid_fused_qkv && !valid_split_qkv) || !llama_layers_->wo_layers_.at(i)) {
+    if (!llama_layers_->wq_layers_.at(i) || !llama_layers_->wk_layers_.at(i) ||
+        !llama_layers_->wv_layers_.at(i) || !llama_layers_->wo_layers_.at(i)) {
       return error::InternalError(
           "Create the matmul layer in the attention and ffn attention layers for "
           "the llama model "
@@ -692,36 +626,21 @@ void LLama2Model::attention_qkv(int32_t layer_idx, const tensor::Tensor& pos_ten
   int32_t pos = pos_tensor.index<int32_t>(0);
   // wq wk wv @ input
   const auto& [key, val] = slice_kv_cache(layer_idx, pos);
+  // query
+  const auto& query_layer = llama_layers_->wq_layers_.at(layer_idx);
+  CHECK_NE(query_layer, nullptr) << "The query layer in the attention block is null pointer.";
+
   auto rmsnorm_output = get_buffer(ModelBufferType::kOutputRMSNorm);
-  if (llama_layers_->qkv_layers_.size() == config_->layer_num_) {
-    tensor::Tensor qkv_output = get_buffer(ModelBufferType::kQKVOutput);
-    const auto& qkv_layer = llama_layers_->qkv_layers_.at(layer_idx);
-    CHECK_NE(qkv_layer, nullptr) << "The fused qkv layer in the attention block is null pointer.";
-    STATUS_CHECK(qkv_layer->forward(rmsnorm_output, qkv_output));
+  STATUS_CHECK(query_layer->forward(rmsnorm_output, query));
 
-    tensor::Tensor q_view = make_tensor_view(qkv_output, 0, config_->dim_);
-    tensor::Tensor k_view = make_tensor_view(qkv_output, config_->dim_, config_->kv_dim_);
-    tensor::Tensor v_view =
-        make_tensor_view(qkv_output, config_->dim_ + config_->kv_dim_, config_->kv_dim_);
-
-    copy_tensor_data(q_view, query, cuda_config_ ? cuda_config_->stream : nullptr);
-    copy_tensor_data(k_view, key, cuda_config_ ? cuda_config_->stream : nullptr);
-    copy_tensor_data(v_view, val, cuda_config_ ? cuda_config_->stream : nullptr);
-  } else {
-    // query
-    const auto& query_layer = llama_layers_->wq_layers_.at(layer_idx);
-    CHECK_NE(query_layer, nullptr) << "The query layer in the attention block is null pointer.";
-    STATUS_CHECK(query_layer->forward(rmsnorm_output, query));
-
-    // key
-    const auto& key_layer = llama_layers_->wk_layers_.at(layer_idx);
-    CHECK_NE(key_layer, nullptr) << "The key layer in the attention block is null pointer.";
-    STATUS_CHECK(key_layer->forward(rmsnorm_output, key));
-    // value
-    const auto& value_layer = llama_layers_->wv_layers_.at(layer_idx);
-    CHECK_NE(value_layer, nullptr) << "The value layer in the attention block is null pointer.";
-    STATUS_CHECK(value_layer->forward(rmsnorm_output, val));
-  }
+  // key
+  const auto& key_layer = llama_layers_->wk_layers_.at(layer_idx);
+  CHECK_NE(key_layer, nullptr) << "The key layer in the attention block is null pointer.";
+  STATUS_CHECK(key_layer->forward(rmsnorm_output, key));
+  // value
+  const auto& value_layer = llama_layers_->wv_layers_.at(layer_idx);
+  CHECK_NE(value_layer, nullptr) << "The value layer in the attention block is null pointer.";
+  STATUS_CHECK(value_layer->forward(rmsnorm_output, val));
 
   // rope
   CHECK_NE(llama_layers_->rope_layer_, nullptr)
