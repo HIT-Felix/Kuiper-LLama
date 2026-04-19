@@ -4,8 +4,8 @@
 #include "matmul_kernel.cuh"
 namespace kernel {
 template <int THREAD_PER_BLOCK, int ROW_PER_BLOCK>
-__global__ void matmul_kernel_cu_fp32(const float* input, const float* weight, float* output, int M,
-                                      int K) {
+__global__ void matmul_kernel_cu_fp32_basic(const float* input, const float* weight, float* output,
+                                            int M, int K) {
   __shared__ float sdata[THREAD_PER_BLOCK];
   unsigned int tid = threadIdx.x;
 
@@ -53,6 +53,67 @@ __global__ void matmul_kernel_cu_fp32(const float* input, const float* weight, f
   }
 }
 
+template <int THREAD_PER_BLOCK, int ROW_PER_BLOCK, int TILE_K>
+__global__ void matmul_kernel_cu_fp32_tiled(const float* input, const float* weight, float* output,
+                                            int M, int K) {
+  const unsigned int tid = threadIdx.x;
+  const int start_row = blockIdx.x * ROW_PER_BLOCK;
+  if (start_row >= K) {
+    return;
+  }
+
+  __shared__ float input_tile[TILE_K];
+  using BlockReduce = cub::BlockReduce<float, THREAD_PER_BLOCK>;
+  __shared__ typename BlockReduce::TempStorage reduce_storage[ROW_PER_BLOCK];
+
+  float partial_sums[ROW_PER_BLOCK];
+#pragma unroll
+  for (int r = 0; r < ROW_PER_BLOCK; ++r) {
+    partial_sums[r] = 0.f;
+  }
+
+  for (int tile_start = 0; tile_start < M; tile_start += TILE_K) {
+    const int tile_size = min(TILE_K, M - tile_start);
+
+    for (int i = tid; i < tile_size; i += THREAD_PER_BLOCK) {
+      input_tile[i] = input[tile_start + i];
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int r = 0; r < ROW_PER_BLOCK; ++r) {
+      const int row = start_row + r;
+      if (row >= K) {
+        continue;
+      }
+
+      const float* row_weight = weight + row * M + tile_start;
+      float local_sum = 0.f;
+
+      for (int i = tid; i < tile_size; i += THREAD_PER_BLOCK) {
+        local_sum += input_tile[i] * row_weight[i];
+      }
+      partial_sums[r] += local_sum;
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int r = 0; r < ROW_PER_BLOCK; ++r) {
+    const int row = start_row + r;
+    if (row >= K) {
+      continue;
+    }
+
+    const float row_sum = BlockReduce(reduce_storage[r]).Sum(partial_sums[r]);
+    __syncthreads();
+    if (tid == 0) {
+      output[row] = row_sum;
+    }
+    __syncthreads();
+  }
+}
+
 template <int THREAD_PER_BLOCK, int ROW_PER_BLOCK>
 __global__ void matmul_kernel_cu_fp32int8(const float* input, const int8_t* weight,
                                           const float* scales, const int32_t group_size,
@@ -95,16 +156,35 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
   CHECK(weight.device_type() == base::DeviceType::kDeviceCUDA);
   const int32_t K = weight.get_dim(0);  // row
   const int32_t M = weight.get_dim(1);  // col
-  int packet_size = 4;
-  // CHECK_EQ(M % packet_size, 0);
-
   CHECK_EQ(M, input.get_dim(0));
+  constexpr int kThreadsPerBlock = 128;
+  constexpr int kRowsPerBlock = 4;
+  constexpr int kTileK = 256;
+  const int32_t block_num = (K + kRowsPerBlock - 1) / kRowsPerBlock;
+
   if (config && config->stream) {
-    matmul_kernel_cu_fp32<128, 1><<<K, 128, 0, config->stream>>>(
-        input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), M, K);
+    if (M >= kTileK) {
+      matmul_kernel_cu_fp32_tiled<kThreadsPerBlock, kRowsPerBlock, kTileK>
+          <<<block_num, kThreadsPerBlock, 0, config->stream>>>(
+              input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), M,
+              K);
+    } else {
+      matmul_kernel_cu_fp32_basic<kThreadsPerBlock, 1>
+          <<<K, kThreadsPerBlock, 0, config->stream>>>(
+              input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), M,
+              K);
+    }
   } else {
-    matmul_kernel_cu_fp32<128, 1><<<K, 128>>>(input.ptr<float>(), weight.ptr<float>(),
-                                              const_cast<float*>(output.ptr<float>()), M, K);
+    if (M >= kTileK) {
+      matmul_kernel_cu_fp32_tiled<kThreadsPerBlock, kRowsPerBlock, kTileK>
+          <<<block_num, kThreadsPerBlock>>>(
+              input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), M,
+              K);
+    } else {
+      matmul_kernel_cu_fp32_basic<kThreadsPerBlock, 1>
+          <<<K, kThreadsPerBlock>>>(input.ptr<float>(), weight.ptr<float>(),
+                                    const_cast<float*>(output.ptr<float>()), M, K);
+    }
   }
 }
 
