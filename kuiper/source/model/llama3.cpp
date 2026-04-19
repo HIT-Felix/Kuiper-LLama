@@ -1,5 +1,6 @@
 #include "model/llama3.h"
 #include <cuda_runtime_api.h>
+#include <cstring>
 #include <glog/logging.h>
 #include <string>
 #include <op/matmul.h>
@@ -15,6 +16,17 @@ namespace model {
 namespace {
 std::string layer_profile_name(const char* model_name, const char* stage, int32_t layer_idx) {
   return std::string(model_name) + "_L" + std::to_string(layer_idx) + "_" + stage;
+}
+
+tensor::Tensor make_tensor_view(const tensor::Tensor& tensor, int64_t offset, int32_t dim0) {
+  CHECK_GE(offset, 0);
+  CHECK_LE(offset + dim0, static_cast<int64_t>(tensor.size()));
+  auto buffer = std::make_shared<base::Buffer>(dim0 * sizeof(float), nullptr,
+                                               const_cast<float*>(tensor.ptr<float>(offset)), true);
+  buffer->set_device_type(tensor.device_type());
+  tensor::Tensor view(base::DataType::kDataTypeFp32, dim0);
+  CHECK(view.assign(buffer));
+  return view;
 }
 }  // namespace
 
@@ -78,6 +90,13 @@ void LLama2Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
   }
 
   for (auto& weight_layer : w1_layers_) {
+    if (weight_layer) {
+      weight_layer->set_cuda_config(config);
+      weight_layer->to_cuda();
+    }
+  }
+
+  for (auto& weight_layer : gate_up_layers_) {
     if (weight_layer) {
       weight_layer->set_cuda_config(config);
       weight_layer->to_cuda();
@@ -344,30 +363,41 @@ void LLama2Model::create_param_layers() {
   // skip ffn rmsnorm
   pos += config_->layer_num_ * dim;
 
-  // w1 layers
   int32_t hidden_dim = config_->hidden_dim_;
+  const size_t matmul_size = static_cast<size_t>(dim) * hidden_dim;
+  const size_t w1_base = pos;
+  const size_t w2_base = w1_base + static_cast<size_t>(config_->layer_num_) * matmul_size;
+  const size_t w3_base = w2_base + static_cast<size_t>(config_->layer_num_) * matmul_size;
+
+  // fused gate/up layers
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto w1 = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, dim);
-    w1->set_weight(0, {hidden_dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
-    llama_layers_->w1_layers_.push_back(w1);
-    pos += dim * hidden_dim;
+    auto gate_up = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim * 2, dim);
+    tensor::Tensor fused_weight(base::DataType::kDataTypeFp32, hidden_dim * 2, dim, true,
+                                base::CPUDeviceAllocatorFactory::get_instance());
+    fused_weight.set_device_type(cpu_device_type);
+
+    float* fused_ptr = fused_weight.ptr<float>();
+    const float* w1_ptr = reinterpret_cast<const float*>(
+        this->raw_model_data_->weight(w1_base + static_cast<size_t>(i) * matmul_size));
+    const float* w3_ptr = reinterpret_cast<const float*>(
+        this->raw_model_data_->weight(w3_base + static_cast<size_t>(i) * matmul_size));
+    std::memcpy(fused_ptr, w1_ptr, matmul_size * sizeof(float));
+    std::memcpy(fused_ptr + matmul_size, w3_ptr, matmul_size * sizeof(float));
+
+    gate_up->set_weight(0, fused_weight);
+    llama_layers_->gate_up_layers_.push_back(gate_up);
   }
 
   // w2 layers
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto w2 = std::make_shared<op::MatmulLayer>(device_type_, dim, hidden_dim);
-    w2->set_weight(0, {dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    w2->set_weight(0, {dim, hidden_dim},
+                   this->raw_model_data_->weight(w2_base + static_cast<size_t>(i) * matmul_size),
+                   cpu_device_type);
     llama_layers_->w2_layers_.push_back(w2);
-    pos += dim * hidden_dim;
   }
 
-  // w3 layers
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto w3 = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, dim);
-    w3->set_weight(0, {hidden_dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
-    llama_layers_->w3_layers_.push_back(w3);
-    pos += dim * hidden_dim;
-  }
+  pos = w3_base + static_cast<size_t>(config_->layer_num_) * matmul_size;
 
   // skip final rms weight
   pos += dim;
@@ -468,9 +498,11 @@ void LLama2Model::init_mem() {
 
   tensor::Tensor w1_output(base::DataType::kDataTypeFp32, config_->hidden_dim_, true, alloc);
   tensor::Tensor w3_output(base::DataType::kDataTypeFp32, config_->hidden_dim_, true, alloc);
+  tensor::Tensor w13_output(base::DataType::kDataTypeFp32, config_->hidden_dim_ * 2, true, alloc);
 
   CHECK(insert_buffer(ModelBufferType::kW1Output, w1_output));
   CHECK(insert_buffer(ModelBufferType::kW3Output, w3_output));
+  CHECK(insert_buffer(ModelBufferType::kW13Output, w13_output));
 
   // kv cache
   tensor::Tensor key_cache(base::DataType::kDataTypeFp32, config_->layer_num_, config_->seq_len_,
@@ -547,17 +579,21 @@ base::Status LLama2Model::create_layers() {
     }
   }
 
-  if (llama_layers_->w1_layers_.size() != config_->layer_num_ ||
-      llama_layers_->w2_layers_.size() != config_->layer_num_ ||
-      llama_layers_->w3_layers_.size() != config_->layer_num_) {
+  const bool has_fused_gate_up = llama_layers_->gate_up_layers_.size() == config_->layer_num_;
+  const bool has_split_gate_up = llama_layers_->w1_layers_.size() == config_->layer_num_ &&
+                                 llama_layers_->w3_layers_.size() == config_->layer_num_;
+  if ((!has_fused_gate_up && !has_split_gate_up) ||
+      llama_layers_->w2_layers_.size() != config_->layer_num_) {
     return error::InternalError(
         "Create the matmul layer in the feedforward layers for the llama model "
         "failed.");
   }
 
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    if (!llama_layers_->w1_layers_.at(i) || !llama_layers_->w2_layers_.at(i) ||
-        !llama_layers_->w3_layers_.at(i)) {
+    const bool valid_fused_gate_up = has_fused_gate_up && llama_layers_->gate_up_layers_.at(i);
+    const bool valid_split_gate_up =
+        has_split_gate_up && llama_layers_->w1_layers_.at(i) && llama_layers_->w3_layers_.at(i);
+    if ((!valid_fused_gate_up && !valid_split_gate_up) || !llama_layers_->w2_layers_.at(i)) {
       return error::InternalError(
           "Create the matmul layer in the feedforward layers for the llama model "
           "failed.");
@@ -705,17 +741,28 @@ void LLama2Model::feed_forward(int32_t layer_idx, const tensor::Tensor& input) c
       << "The final rmsnorm layer in the feedforward block is null pointer";
   STATUS_CHECK(ffn_rmsnorm->forward(input, ffn_norm_output));
 
-  // w1
-  tensor::Tensor w1_output = get_buffer(ModelBufferType::kW1Output);
-  const auto& w1_layer = llama_layers_->w1_layers_.at(layer_idx);
-  CHECK_NE(w1_layer, nullptr) << "The w1 layer in the feedforward block is null pointer";
-  STATUS_CHECK(w1_layer->forward(ffn_norm_output, w1_output));
+  tensor::Tensor w1_output;
+  tensor::Tensor w3_ouput;
+  if (llama_layers_->gate_up_layers_.size() == config_->layer_num_) {
+    tensor::Tensor gate_up_output = get_buffer(ModelBufferType::kW13Output);
+    const auto& gate_up_layer = llama_layers_->gate_up_layers_.at(layer_idx);
+    CHECK_NE(gate_up_layer, nullptr) << "The fused gate/up layer is null pointer";
+    STATUS_CHECK(gate_up_layer->forward(ffn_norm_output, gate_up_output));
 
-  // w3
-  tensor::Tensor w3_ouput = get_buffer(ModelBufferType::kW3Output);
-  const auto& w3_layer = llama_layers_->w3_layers_.at(layer_idx);
-  CHECK_NE(w3_layer, nullptr) << "The w3 layer in the feedforward block is null pointer";
-  STATUS_CHECK(w3_layer->forward(ffn_norm_output, w3_ouput));
+    w1_output = make_tensor_view(gate_up_output, 0, config_->hidden_dim_);
+    w3_ouput = make_tensor_view(gate_up_output, config_->hidden_dim_, config_->hidden_dim_);
+  } else {
+    // Fallback path for models that still keep split gate/up projections.
+    w1_output = get_buffer(ModelBufferType::kW1Output);
+    const auto& w1_layer = llama_layers_->w1_layers_.at(layer_idx);
+    CHECK_NE(w1_layer, nullptr) << "The w1 layer in the feedforward block is null pointer";
+    STATUS_CHECK(w1_layer->forward(ffn_norm_output, w1_output));
+
+    w3_ouput = get_buffer(ModelBufferType::kW3Output);
+    const auto& w3_layer = llama_layers_->w3_layers_.at(layer_idx);
+    CHECK_NE(w3_layer, nullptr) << "The w3 layer in the feedforward block is null pointer";
+    STATUS_CHECK(w3_layer->forward(ffn_norm_output, w3_ouput));
+  }
 
   // SwiGLU
   CHECK_NE(llama_layers_->swiglu_layer_, nullptr)
