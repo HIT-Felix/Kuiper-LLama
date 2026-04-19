@@ -20,6 +20,7 @@ struct LLama2Layers {
   std::vector<std::shared_ptr<op::Layer>> wo_layers_;
 
   std::vector<std::shared_ptr<op::Layer>> w1_layers_;
+  std::vector<std::shared_ptr<op::Layer>> gate_up_layers_;
   std::vector<std::shared_ptr<op::Layer>> w2_layers_;
   std::vector<std::shared_ptr<op::Layer>> rmsnorm_layers_;
   std::vector<std::shared_ptr<op::Layer>> w3_layers_;
