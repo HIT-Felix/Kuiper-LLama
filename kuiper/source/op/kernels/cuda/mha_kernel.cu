@@ -31,7 +31,7 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
 
   float sum = 0.0f;
   for (int i = tid; i < size; i += step) {
-    x[i] = __expf(x[i] - max_val);
+    x[i] = expf(x[i] - max_val);
     sum += x[i];
   }
   sum = BlockReduce(temp).Sum(sum);
@@ -57,9 +57,7 @@ __global__ void multi_head_attention_kernel(int32_t pos, int32_t seq_len, float*
     return;
   }
 
-  extern __shared__ float smem[];
-  float* s_query_head = smem;
-  float* s_score_tile = smem + head_size;
+  extern __shared__ float s_query_head[];
   float scale = 1.f / sqrtf(float(head_size));
   float* query_head = query + head * head_size;
 
@@ -96,42 +94,13 @@ __global__ void multi_head_attention_kernel(int32_t pos, int32_t seq_len, float*
   __syncthreads();
 
   float* output_head = output + head * head_size;
-  // 使用float4累加输出，并将score分块缓存到共享内存，减少重复的全局内存读取
-  int vec4_size = head_size / 4;
-  float4* output_head_vec4 = reinterpret_cast<float4*>(output_head);
-  for (int vec_idx = threadIdx.x; vec_idx < vec4_size; vec_idx += blockDim.x) {
-    float4 value = make_float4(0.f, 0.f, 0.f, 0.f);
-    int dim_offset = vec_idx * 4;
-
-    for (int tile_start = 0; tile_start <= pos; tile_start += blockDim.x) {
-      int t = tile_start + threadIdx.x;
-      if (t <= pos) {
-        s_score_tile[threadIdx.x] = score_head[t];
-      }
-      __syncthreads();
-
-      int tile_size = min(blockDim.x, pos + 1 - tile_start);
-      const float* value_head = value_cache + layer_offset + tile_start * kv_dim + head_offset +
-                                dim_offset;
-      for (int j = 0; j < tile_size; ++j) {
-        float score = s_score_tile[j];
-        float4 value_vec = *reinterpret_cast<const float4*>(value_head + j * kv_dim);
-        value.x += score * value_vec.x;
-        value.y += score * value_vec.y;
-        value.z += score * value_vec.z;
-        value.w += score * value_vec.w;
-      }
-      __syncthreads();
-    }
-    output_head_vec4[vec_idx] = value;
-  }
-
-  // 处理不是4对齐时剩余的尾部元素
-  for (int i = vec4_size * 4 + threadIdx.x; i < head_size; i += blockDim.x) {
+  // 使用自注意力分数对value矩阵加权
+  for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
     float value = 0.0f;
-    for (int t = 0; t <= pos; ++t) {
+    for (int t = 0; t <= pos; t++) {
       float* value_head = value_cache + layer_offset + t * kv_dim + head_offset;
-      value += score_head[t] * value_head[i];
+      float score = score_head[t];
+      value += score * value_head[i];
     }
     output_head[i] = value;
   }
@@ -152,8 +121,7 @@ void mha_kernel_cu(int32_t pos, int32_t head_num, int32_t layer_index, int32_t s
   float* value_cache = const_cast<float*>(value_cache_tensor.ptr<float>());
 
   cudaStream_t stream = config->stream;
-  size_t shared_mem_size = static_cast<size_t>(head_size + thread_num) * sizeof(float);
-  multi_head_attention_kernel<<<head_num, thread_num, shared_mem_size, stream>>>(
+  multi_head_attention_kernel<<<head_num, thread_num, head_size * sizeof(float), stream>>>(
       pos, seq_len, query, score, output, key_cache, value_cache, kv_dim, kv_mul, head_num,
       head_size, layer_offset);
 }
