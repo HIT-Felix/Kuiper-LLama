@@ -30,7 +30,6 @@ enum class ModelBufferType {
 
   kSinCache = 17,
   kCosCache = 18,
-  kW13Output = 19,
 };
 }
 
