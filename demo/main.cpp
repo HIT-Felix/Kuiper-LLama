@@ -2,10 +2,16 @@
 #include <base/tick.h>
 #include <glog/logging.h>
 #include <cstdlib>
+#include <string>
 #include "model/llama3.h"
 
-int32_t generate(const model::LLama2Model& model, const std::string& sentence, int total_steps,
-                 bool need_output = false) {
+struct GenerateResult {
+  int32_t steps = 0;
+  std::string response;
+};
+
+GenerateResult generate(const model::LLama2Model& model, const std::string& sentence,
+                        int total_steps) {
   const auto prompt_tokens = model.encode(sentence);
   const int32_t prompt_len = static_cast<int32_t>(prompt_tokens.size());
   LOG_IF(FATAL, prompt_tokens.empty()) << "The tokens is empty.";
@@ -25,15 +31,18 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
     ++pos;
   }
 
-  if (need_output) {
-    printf("%s", model.decode(words).data());
-    fflush(stdout);
-  }
-  return std::min(pos, total_steps);
+  GenerateResult result;
+  result.steps = std::min(pos, total_steps);
+  result.response = model.decode(words);
+  return result;
 }
 
 
 int main(int argc, char* argv[]) {
+  google::InitGoogleLogging(argv[0]);
+  google::InstallFailureSignalHandler();
+  FLAGS_logtostderr = 1;
+
   if (argc < 3 || argc > 5) {
     LOG(INFO) << "Usage: ./demo checkpoint_path tokenizer_path [prompt] [max_steps]";
     return -1;
@@ -55,12 +64,12 @@ int main(int argc, char* argv[]) {
   auto start = std::chrono::steady_clock::now();
   printf("Generating...\n");
   printf("Prompt: %s\n", sentence.c_str());
-  printf("Response: ");
   fflush(stdout);
-  int steps = generate(model, sentence, total_steps, true);
+  const GenerateResult result = generate(model, sentence, total_steps);
   auto end = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration<double>(end - start).count();
-  printf("\nsteps/s:%lf\n", static_cast<double>(steps) / duration);
+  printf("Response: %s\n", result.response.c_str());
+  printf("\nsteps/s:%lf\n", static_cast<double>(result.steps) / duration);
   const auto& stats = model.generation_stats();
   const double prefill_tokens_per_s =
       stats.prefill_latency_ms > 0.0
@@ -79,5 +88,6 @@ int main(int argc, char* argv[]) {
          stats.block_size, stats.prompt_last_block_tokens, stats.prompt_tail_fragmentation,
          stats.kv_bytes_used, stats.kv_bytes_reserved);
   fflush(stdout);
+  google::ShutdownGoogleLogging();
   return 0;
 }
