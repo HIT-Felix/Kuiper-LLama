@@ -32,12 +32,34 @@ struct LLama2Layers {
   void to_cuda(std::shared_ptr<kernel::CudaConfig> config);
 };
 
+struct LLamaGenerationStats {
+  double prefill_latency_ms = 0.0;
+  double decode_latency_ms = 0.0;
+  double ttft_ms = 0.0;
+  int32_t prefill_tokens = 0;
+  int32_t decode_tokens = 0;
+  int32_t allocated_blocks = 0;
+  int32_t block_size = 0;
+  int32_t prompt_last_block_tokens = 0;
+  double prompt_tail_fragmentation = 0.0;
+  size_t kv_bytes_used = 0;
+  size_t kv_bytes_reserved = 0;
+};
+
 class LLama2Model : public Model {
  public:
   explicit LLama2Model(base::TokenizerType tokenizer_type, std::string token_path,
                        std::string model_path, bool is_quant_model);
 
   base::Status init(base::DeviceType device_type) override;
+
+  base::Status prefill(const std::vector<int32_t>& prompt_tokens, int32_t& next) const;
+
+  base::Status decode_step(int32_t token, int32_t pos, int32_t& next) const;
+
+  void reset_generation_state() const;
+
+  const LLamaGenerationStats& generation_stats() const;
 
   base::Status predict(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
                        bool is_prompt, int& next) const override;
@@ -73,11 +95,21 @@ class LLama2Model : public Model {
 
   int32_t post_processing(const tensor::Tensor& pos, bool is_prompt) const override;
 
+  base::Status prepare_paged_blocks_for_pos(int32_t pos) const;
+
+  void sync_stream() const;
+
+  void log_prefill_summary() const;
+
+  void log_decode_progress(int32_t pos, int32_t token) const;
+
 private:
   std::shared_ptr<kernel::CudaConfig> cuda_config_;
   std::unique_ptr<LLama2Layers> llama_layers_;
   int32_t paged_kv_block_size_ = 16;
   int32_t paged_kv_block_num_ = 0;
+  mutable int32_t active_paged_blocks_ = 0;
+  mutable LLamaGenerationStats generation_stats_;
 };
 }  // namespace model
 

@@ -1,4 +1,5 @@
 #include "model/llama3.h"
+#include <chrono>
 #include <cuda_runtime_api.h>
 #include <cstring>
 #include <glog/logging.h>
@@ -75,6 +76,11 @@ void copy_tensor_data(const tensor::Tensor& src, const tensor::Tensor& dst, void
                              base::CPUDeviceAllocatorFactory::get_instance());
   allocator->memcpy(src.ptr<float>(), const_cast<float*>(dst.ptr<float>()), src.byte_size(), kind,
                     stream);
+}
+
+double elapsed_ms(const std::chrono::steady_clock::time_point& begin,
+                  const std::chrono::steady_clock::time_point& end) {
+  return std::chrono::duration<double, std::milli>(end - begin).count();
 }
 }  // namespace
 
@@ -237,6 +243,157 @@ base::Status LLama2Model::forward(const tensor::Tensor& input, const tensor::Ten
     feed_forward(layer_idx, input);
   }
   cls_logits(input);
+  return base::error::Success();
+}
+
+void LLama2Model::sync_stream() const {
+  if (device_type_ == base::DeviceType::kDeviceCUDA && cuda_config_ && cuda_config_->stream) {
+    cudaStreamSynchronize(cuda_config_->stream);
+  }
+}
+
+void LLama2Model::reset_generation_state() const {
+  generation_stats_ = {};
+  active_paged_blocks_ = 0;
+  generation_stats_.block_size = paged_kv_block_size_;
+  generation_stats_.kv_bytes_reserved =
+      static_cast<size_t>(config_->layer_num_) * paged_kv_block_num_ * paged_kv_block_size_ *
+      config_->kv_dim_ * sizeof(float) * 2;
+
+  auto zero_tensor = [this](const tensor::Tensor& tensor) {
+    if (tensor.is_empty() || !tensor.get_buffer() || !tensor.get_buffer()->allocator()) {
+      return;
+    }
+    tensor.get_buffer()->allocator()->memset_zero(const_cast<void*>(tensor.get_buffer()->ptr()),
+                                                  tensor.byte_size(),
+                                                  cuda_config_ ? cuda_config_->stream : nullptr);
+  };
+
+  zero_tensor(get_buffer(ModelBufferType::kKeyCache));
+  zero_tensor(get_buffer(ModelBufferType::kValueCache));
+  zero_tensor(get_buffer(ModelBufferType::kScoreStorage));
+  sync_stream();
+}
+
+const LLamaGenerationStats& LLama2Model::generation_stats() const { return generation_stats_; }
+
+base::Status LLama2Model::prepare_paged_blocks_for_pos(int32_t pos) const {
+  if (pos < 0) {
+    return base::error::InvalidArgument("The token position must be non-negative.");
+  }
+  const int32_t required_blocks = (pos + paged_kv_block_size_) / paged_kv_block_size_;
+  if (required_blocks > paged_kv_block_num_) {
+    return base::error::InvalidArgument("The prompt exceeds paged KV cache capacity.");
+  }
+  if (required_blocks > active_paged_blocks_) {
+    const int32_t begin_token = active_paged_blocks_ * paged_kv_block_size_;
+    active_paged_blocks_ = required_blocks;
+    generation_stats_.allocated_blocks = active_paged_blocks_;
+    LOG(INFO) << "[PagedBlocks] activated logical_block=" << (active_paged_blocks_ - 1)
+              << ", token_range=[" << begin_token << ", "
+              << (active_paged_blocks_ * paged_kv_block_size_ - 1) << "]"
+              << ", active_blocks=" << active_paged_blocks_ << "/" << paged_kv_block_num_
+              << ", covered_tokens=" << active_paged_blocks_ * paged_kv_block_size_;
+  }
+  return base::error::Success();
+}
+
+void LLama2Model::log_prefill_summary() const {
+  const double prompt_tokens_per_s =
+      generation_stats_.prefill_latency_ms > 0.0
+          ? static_cast<double>(generation_stats_.prefill_tokens) * 1000.0 /
+                generation_stats_.prefill_latency_ms
+          : 0.0;
+  LOG(INFO) << "[PrefillSummary] tokens=" << generation_stats_.prefill_tokens
+            << ", latency_ms=" << generation_stats_.prefill_latency_ms
+            << ", prompt_tokens_per_s=" << prompt_tokens_per_s
+            << ", ttft_ms=" << generation_stats_.ttft_ms
+            << ", block_size=" << generation_stats_.block_size
+            << ", allocated_blocks=" << generation_stats_.allocated_blocks << "/"
+            << paged_kv_block_num_
+            << ", prompt_last_block_tokens=" << generation_stats_.prompt_last_block_tokens
+            << ", prompt_tail_fragmentation=" << generation_stats_.prompt_tail_fragmentation
+            << ", kv_used=" << format_bytes(generation_stats_.kv_bytes_used)
+            << ", kv_reserved=" << format_bytes(generation_stats_.kv_bytes_reserved);
+}
+
+void LLama2Model::log_decode_progress(int32_t pos, int32_t token) const {
+  if (generation_stats_.decode_tokens == 1 || generation_stats_.decode_tokens % 32 == 0 ||
+      is_sentence_ending(token)) {
+    const double decode_tokens_per_s =
+        generation_stats_.decode_latency_ms > 0.0
+            ? static_cast<double>(generation_stats_.decode_tokens) * 1000.0 /
+                  generation_stats_.decode_latency_ms
+            : 0.0;
+    LOG(INFO) << "[DecodeSummary] decoded_tokens=" << generation_stats_.decode_tokens
+              << ", last_pos=" << pos << ", last_token=" << token
+              << ", latency_ms=" << generation_stats_.decode_latency_ms
+              << ", decode_tokens_per_s=" << decode_tokens_per_s
+              << ", active_blocks=" << active_paged_blocks_;
+  }
+}
+
+base::Status LLama2Model::prefill(const std::vector<int32_t>& prompt_tokens, int32_t& next) const {
+  if (prompt_tokens.empty()) {
+    return base::error::InvalidArgument("The prompt tokens are empty.");
+  }
+
+  reset_generation_state();
+  const auto prefill_begin = std::chrono::steady_clock::now();
+  const auto& prompt_embedding = embedding(prompt_tokens);
+  tensor::Tensor pos_tensor = get_buffer(ModelBufferType::kInputPos);
+
+  next = -1;
+  for (int32_t pos = 0; pos < static_cast<int32_t>(prompt_tokens.size()); ++pos) {
+    STATUS_CHECK(prepare_paged_blocks_for_pos(pos));
+    pos_tensor.index<int32_t>(0) = pos;
+    const bool is_last_prompt_token = pos == static_cast<int32_t>(prompt_tokens.size()) - 1;
+    if (!is_last_prompt_token) {
+      tensor::Tensor input = fill_input(pos_tensor, prompt_embedding, true);
+      STATUS_CHECK(predict(input, pos_tensor, true, next));
+    } else {
+      const auto& final_token_embedding = embedding({prompt_tokens.back()});
+      tensor::Tensor input = fill_input(pos_tensor, final_token_embedding, false);
+      STATUS_CHECK(predict(input, pos_tensor, false, next));
+    }
+  }
+  sync_stream();
+  const auto prefill_end = std::chrono::steady_clock::now();
+  generation_stats_.prefill_tokens = static_cast<int32_t>(prompt_tokens.size());
+  generation_stats_.prefill_latency_ms = elapsed_ms(prefill_begin, prefill_end);
+  generation_stats_.ttft_ms = generation_stats_.prefill_latency_ms;
+  generation_stats_.prompt_last_block_tokens =
+      prompt_tokens.size() % paged_kv_block_size_ == 0
+          ? paged_kv_block_size_
+          : static_cast<int32_t>(prompt_tokens.size() % paged_kv_block_size_);
+  generation_stats_.prompt_tail_fragmentation =
+      1.0 - static_cast<double>(generation_stats_.prompt_last_block_tokens) /
+                static_cast<double>(paged_kv_block_size_);
+  generation_stats_.kv_bytes_used =
+      static_cast<size_t>(config_->layer_num_) * generation_stats_.prefill_tokens *
+      config_->kv_dim_ * sizeof(float) * 2;
+  log_prefill_summary();
+  return base::error::Success();
+}
+
+base::Status LLama2Model::decode_step(int32_t token, int32_t pos, int32_t& next) const {
+  STATUS_CHECK(prepare_paged_blocks_for_pos(pos));
+  const auto decode_begin = std::chrono::steady_clock::now();
+  tensor::Tensor pos_tensor = get_buffer(ModelBufferType::kInputPos);
+  pos_tensor.index<int32_t>(0) = pos;
+  const auto& token_embedding = embedding({token});
+  tensor::Tensor input = fill_input(pos_tensor, token_embedding, false);
+  STATUS_CHECK(predict(input, pos_tensor, false, next));
+  sync_stream();
+  const auto decode_end = std::chrono::steady_clock::now();
+
+  generation_stats_.decode_tokens += 1;
+  generation_stats_.decode_latency_ms += elapsed_ms(decode_begin, decode_end);
+  generation_stats_.kv_bytes_used =
+      static_cast<size_t>(config_->layer_num_) *
+      (generation_stats_.prefill_tokens + generation_stats_.decode_tokens) * config_->kv_dim_ *
+      sizeof(float) * 2;
+  log_decode_progress(pos, next);
   return base::error::Success();
 }
 
