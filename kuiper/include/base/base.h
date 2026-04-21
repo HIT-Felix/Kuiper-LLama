@@ -30,6 +30,7 @@ enum class ModelBufferType {
 
   kSinCache = 17,
   kCosCache = 18,
+  kPagedBlockTable = 19,
 };
 }
 

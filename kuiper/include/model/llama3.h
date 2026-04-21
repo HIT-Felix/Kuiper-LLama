@@ -45,6 +45,9 @@ class LLama2Model : public Model {
   base::Status forward(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
                        int& next) const override;
 
+  std::pair<tensor::Tensor, tensor::Tensor> slice_kv_cache(int32_t layer_idx,
+                                                           int32_t token_pos) const override;
+
   op::EmbeddingOutput embedding(const std::vector<int>& tokens) const override;
 
  private:
@@ -70,9 +73,11 @@ class LLama2Model : public Model {
 
   int32_t post_processing(const tensor::Tensor& pos, bool is_prompt) const override;
 
- private:
+private:
   std::shared_ptr<kernel::CudaConfig> cuda_config_;
   std::unique_ptr<LLama2Layers> llama_layers_;
+  int32_t paged_kv_block_size_ = 16;
+  int32_t paged_kv_block_num_ = 0;
 };
 }  // namespace model
 

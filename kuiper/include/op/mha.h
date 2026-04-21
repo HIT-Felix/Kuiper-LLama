@@ -13,6 +13,7 @@ class MultiHeadAttention : public op::Layer {
 
   void set_pos(int32_t pos);
   void set_layer_idx(int32_t layer_idx);
+  void set_block_size(int32_t block_size);
 
   base::Status forward() override;
 
@@ -24,6 +25,7 @@ class MultiHeadAttention : public op::Layer {
   int32_t seq_len_ = 0;
   int32_t head_num_ = 0;
   int32_t head_size_ = 0;
+  int32_t block_size_ = 0;
 };
 }  // namespace op
 #endif  // KUIPER_INLCUDE_MHA_H

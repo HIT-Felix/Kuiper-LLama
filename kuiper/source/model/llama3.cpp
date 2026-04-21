@@ -18,6 +18,23 @@ std::string layer_profile_name(const char* model_name, const char* stage, int32_
   return std::string(model_name) + "_L" + std::to_string(layer_idx) + "_" + stage;
 }
 
+std::string format_bytes(size_t bytes) {
+  constexpr double kKB = 1024.0;
+  constexpr double kMB = 1024.0 * 1024.0;
+  constexpr double kGB = 1024.0 * 1024.0 * 1024.0;
+  char buf[64];
+  if (bytes >= static_cast<size_t>(kGB)) {
+    snprintf(buf, sizeof(buf), "%.2f GB", bytes / kGB);
+  } else if (bytes >= static_cast<size_t>(kMB)) {
+    snprintf(buf, sizeof(buf), "%.2f MB", bytes / kMB);
+  } else if (bytes >= static_cast<size_t>(kKB)) {
+    snprintf(buf, sizeof(buf), "%.2f KB", bytes / kKB);
+  } else {
+    snprintf(buf, sizeof(buf), "%zu B", bytes);
+  }
+  return std::string(buf);
+}
+
 tensor::Tensor make_tensor_view(const tensor::Tensor& tensor, int64_t offset, int32_t dim0) {
   CHECK_GE(offset, 0);
   CHECK_LE(offset + dim0, static_cast<int64_t>(tensor.size()));
@@ -231,6 +248,8 @@ void LLama2Model::create_nonparam_layers() {
   llama_layers_->mha_layer_ = std::make_shared<op::MultiHeadAttention>(
       device_type_, 0, config_->kv_mul_, config_->kv_dim_, config_->seq_len_, config_->head_num_,
       config_->head_size_);
+  std::dynamic_pointer_cast<op::MultiHeadAttention>(llama_layers_->mha_layer_)
+      ->set_block_size(paged_kv_block_size_);
 
   llama_layers_->add_layer_ = std::make_shared<op::VecAddLayer>(device_type_);
 
@@ -534,14 +553,26 @@ void LLama2Model::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kW1Output, w1_output));
   CHECK(insert_buffer(ModelBufferType::kW3Output, w3_output));
 
-  // kv cache
-  tensor::Tensor key_cache(base::DataType::kDataTypeFp32, config_->layer_num_, config_->seq_len_,
-                           config_->kv_dim_, true, alloc);
-  tensor::Tensor value_cache(base::DataType::kDataTypeFp32, config_->layer_num_, config_->seq_len_,
-                             config_->kv_dim_, true, alloc);
+  paged_kv_block_num_ = (config_->seq_len_ + paged_kv_block_size_ - 1) / paged_kv_block_size_;
+
+  // paged kv cache: [layer_num, block_num, block_size, kv_dim]
+  tensor::Tensor key_cache(base::DataType::kDataTypeFp32, config_->layer_num_, paged_kv_block_num_,
+                           paged_kv_block_size_, config_->kv_dim_, true, alloc);
+  tensor::Tensor value_cache(base::DataType::kDataTypeFp32, config_->layer_num_,
+                             paged_kv_block_num_, paged_kv_block_size_, config_->kv_dim_, true,
+                             alloc);
+
+  tensor::Tensor block_table(base::DataType::kDataTypeInt32, paged_kv_block_num_, true, alloc_cpu);
+  for (int32_t i = 0; i < paged_kv_block_num_; ++i) {
+    block_table.index<int32_t>(i) = i;
+  }
+  if (device_type_ == base::DeviceType::kDeviceCUDA) {
+    block_table.to_cuda(cuda_config_ ? cuda_config_->stream : nullptr);
+  }
 
   CHECK(insert_buffer(ModelBufferType::kKeyCache, key_cache));
   CHECK(insert_buffer(ModelBufferType::kValueCache, value_cache));
+  CHECK(insert_buffer(ModelBufferType::kPagedBlockTable, block_table));
 
   // Wq query output
   tensor::Tensor query(base::DataType::kDataTypeFp32, config_->dim_, true, alloc);
@@ -566,6 +597,30 @@ void LLama2Model::init_mem() {
   }
 
   CHECK(insert_buffer(ModelBufferType::kForwardOutput, forward_output));
+}
+
+std::pair<tensor::Tensor, tensor::Tensor> LLama2Model::slice_kv_cache(int32_t layer_idx,
+                                                                      int32_t token_pos) const {
+  const int32_t logical_block_idx = token_pos / paged_kv_block_size_;
+  const int32_t token_offset = token_pos % paged_kv_block_size_;
+  const int32_t physical_block_idx = logical_block_idx;
+  const int32_t cache_offset =
+      (((layer_idx * paged_kv_block_num_) + physical_block_idx) * paged_kv_block_size_ +
+       token_offset) *
+      config_->kv_dim_;
+
+  float* key_cache_ptr =
+      const_cast<float*>(get_buffer(ModelBufferType::kKeyCache).ptr<float>(cache_offset));
+  float* val_cache_ptr =
+      const_cast<float*>(get_buffer(ModelBufferType::kValueCache).ptr<float>(cache_offset));
+
+  tensor::Tensor key(base::DataType::kDataTypeFp32, config_->kv_dim_, false, nullptr,
+                     key_cache_ptr);
+  tensor::Tensor val(base::DataType::kDataTypeFp32, config_->kv_dim_, false, nullptr,
+                     val_cache_ptr);
+  key.set_device_type(device_type_);
+  val.set_device_type(device_type_);
+  return {key, val};
 }
 
 base::Status LLama2Model::create_layers() {
@@ -705,8 +760,12 @@ void LLama2Model::attention_qkv(int32_t layer_idx, const tensor::Tensor& pos_ten
         make_tensor_view(qkv_output, config_->dim_ + config_->kv_dim_, config_->kv_dim_);
 
     copy_tensor_data(q_view, query, cuda_config_ ? cuda_config_->stream : nullptr);
-    copy_tensor_data(k_view, key, cuda_config_ ? cuda_config_->stream : nullptr);
-    copy_tensor_data(v_view, val, cuda_config_ ? cuda_config_->stream : nullptr);
+    {
+      base::ScopedCudaProfile profile("PagedKVWrite",
+                                      cuda_config_ ? cuda_config_->stream : nullptr);
+      copy_tensor_data(k_view, key, cuda_config_ ? cuda_config_->stream : nullptr);
+      copy_tensor_data(v_view, val, cuda_config_ ? cuda_config_->stream : nullptr);
+    }
   } else {
     // query
     const auto& query_layer = llama_layers_->wq_layers_.at(layer_idx);
@@ -750,6 +809,7 @@ void LLama2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_ten
   // VAL = [val1,val2,...val t]
   // output @ VAL = 最终的结果
   tensor::Tensor val_cache = get_buffer(ModelBufferType::kValueCache);
+  tensor::Tensor block_table = get_buffer(ModelBufferType::kPagedBlockTable);
 
   tensor::Tensor mha_output = get_buffer(ModelBufferType::kOutputMHA);
   tensor::Tensor score_storage = get_buffer(ModelBufferType::kScoreStorage);
@@ -758,9 +818,28 @@ void LLama2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_ten
   const auto& mha_layer = llama_layers_->mha_layer_;
   CHECK_NE(mha_layer, nullptr) << "The multi head attention layer is null pointer.";
   int pos = pos_tensor.index<int32_t>(0);
+  if (layer_idx == 0 &&
+      (pos == 0 || pos + 1 == config_->seq_len_ || ((pos + 1) % (paged_kv_block_size_ * 8) == 0))) {
+    const size_t reserved_bytes = static_cast<size_t>(config_->layer_num_) * paged_kv_block_num_ *
+                                  paged_kv_block_size_ * config_->kv_dim_ * sizeof(float) * 2;
+    const int32_t used_tokens = pos + 1;
+    const int32_t used_blocks = (used_tokens + paged_kv_block_size_ - 1) / paged_kv_block_size_;
+    const size_t used_bytes = static_cast<size_t>(config_->layer_num_) * used_tokens *
+                              config_->kv_dim_ * sizeof(float) * 2;
+    const size_t rounded_bytes = static_cast<size_t>(config_->layer_num_) * used_blocks *
+                                 paged_kv_block_size_ * config_->kv_dim_ * sizeof(float) * 2;
+    const double fragmentation =
+        rounded_bytes == 0 ? 0.0 : 1.0 - static_cast<double>(used_bytes) / rounded_bytes;
+    LOG(INFO) << "[PagedAttention] tokens=" << used_tokens << ", block_size="
+              << paged_kv_block_size_ << ", used_blocks=" << used_blocks << "/"
+              << paged_kv_block_num_ << ", kv_used=" << format_bytes(used_bytes)
+              << ", kv_reserved=" << format_bytes(reserved_bytes)
+              << ", tail_fragmentation=" << fragmentation;
+  }
   std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_pos(pos);
   std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_layer_idx(layer_idx);
-  STATUS_CHECK(mha_layer->forward(query, score_storage, key_cache, val_cache, mha_output));
+  STATUS_CHECK(mha_layer->forward(query, score_storage, key_cache, val_cache, block_table,
+                                  mha_output));
 
   // wo @ attention output
   tensor::Tensor attn_output = get_buffer(ModelBufferType::kAttnOutput);
