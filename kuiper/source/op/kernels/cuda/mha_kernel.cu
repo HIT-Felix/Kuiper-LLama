@@ -78,30 +78,46 @@ __global__ void multi_head_attention_kernel(int32_t pos, int32_t seq_len, float*
   // kv_dim = head_size * head_num / kv_num，GQA情况下的key,value 维度
   int head_offset = (head / kv_mul) * head_size;
   // 计算自注意力分数
-  for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
-    float* key_head = nullptr;
-    if (use_paged_kv) {
-      const int32_t logical_block_idx = t / block_size;
-      const int32_t token_offset = t % block_size;
+  if (use_paged_kv) {
+    const int32_t last_block_idx = pos / block_size;
+    for (int32_t logical_block_idx = 0; logical_block_idx <= last_block_idx; ++logical_block_idx) {
       const int32_t physical_block_idx = block_table[logical_block_idx];
-      key_head = key_cache + layer_index * layer_stride + physical_block_idx * block_stride +
-                 token_offset * kv_dim + head_offset;
-    } else {
-      const int32_t layer_offset = layer_index * seq_len * kv_dim;
-      key_head = key_cache + layer_offset + t * kv_dim + head_offset;
+      const int32_t tokens_in_block =
+          (logical_block_idx == last_block_idx) ? (pos % block_size) + 1 : block_size;
+      float* key_block = key_cache + layer_index * layer_stride + physical_block_idx * block_stride;
+
+      for (int token_offset = threadIdx.x; token_offset < tokens_in_block;
+           token_offset += blockDim.x) {
+        float* key_head = key_block + token_offset * kv_dim + head_offset;
+        float score = 0.0f;
+        for (int i = 0; i < head_size; i += 4) {
+          float4 key_val = *reinterpret_cast<float4*>(key_head + i);
+          float4 query_val = *reinterpret_cast<float4*>(s_query_head + i);
+
+          score += key_val.x * query_val.x + key_val.y * query_val.y + key_val.z * query_val.z +
+                   key_val.w * query_val.w;
+        }
+
+        const int32_t t = logical_block_idx * block_size + token_offset;
+        score_head[t] = score * scale;
+      }
     }
+  } else {
+    const int32_t layer_offset = layer_index * seq_len * kv_dim;
+    for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
+      float* key_head = key_cache + layer_offset + t * kv_dim + head_offset;
 
-    float score = 0.0f;
-    for (int i = 0; i < head_size; i += 4) {
-      float4 key_val = *reinterpret_cast<float4*>(key_head + i);
-      float4 query_val = *reinterpret_cast<float4*>(s_query_head + i);
+      float score = 0.0f;
+      for (int i = 0; i < head_size; i += 4) {
+        float4 key_val = *reinterpret_cast<float4*>(key_head + i);
+        float4 query_val = *reinterpret_cast<float4*>(s_query_head + i);
 
-      score += key_val.x * query_val.x + key_val.y * query_val.y + key_val.z * query_val.z +
-               key_val.w * query_val.w;
+        score += key_val.x * query_val.x + key_val.y * query_val.y + key_val.z * query_val.z +
+                 key_val.w * query_val.w;
+      }
+
+      score_head[t] = score * scale;
     }
-
-    score *= scale;
-    score_head[t] = score;
   }
   __syncthreads();
 
@@ -110,24 +126,36 @@ __global__ void multi_head_attention_kernel(int32_t pos, int32_t seq_len, float*
 
   float* output_head = output + head * head_size;
   // 使用自注意力分数对value矩阵加权
-  for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
-    float value = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-      float* value_head = nullptr;
-      if (use_paged_kv) {
-        const int32_t logical_block_idx = t / block_size;
-        const int32_t token_offset = t % block_size;
+  if (use_paged_kv) {
+    const int32_t last_block_idx = pos / block_size;
+    for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
+      float value = 0.0f;
+      for (int32_t logical_block_idx = 0; logical_block_idx <= last_block_idx; ++logical_block_idx) {
         const int32_t physical_block_idx = block_table[logical_block_idx];
-        value_head = value_cache + layer_index * layer_stride + physical_block_idx * block_stride +
-                     token_offset * kv_dim + head_offset;
-      } else {
-        const int32_t layer_offset = layer_index * seq_len * kv_dim;
-        value_head = value_cache + layer_offset + t * kv_dim + head_offset;
+        const int32_t tokens_in_block =
+            (logical_block_idx == last_block_idx) ? (pos % block_size) + 1 : block_size;
+        float* value_block =
+            value_cache + layer_index * layer_stride + physical_block_idx * block_stride;
+        const int32_t score_base = logical_block_idx * block_size;
+
+        for (int token_offset = 0; token_offset < tokens_in_block; ++token_offset) {
+          const int32_t t = score_base + token_offset;
+          float* value_head = value_block + token_offset * kv_dim + head_offset;
+          value += score_head[t] * value_head[i];
+        }
       }
-      float score = score_head[t];
-      value += score * value_head[i];
+      output_head[i] = value;
     }
-    output_head[i] = value;
+  } else {
+    const int32_t layer_offset = layer_index * seq_len * kv_dim;
+    for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
+      float value = 0.0f;
+      for (int t = 0; t <= pos; t++) {
+        float* value_head = value_cache + layer_offset + t * kv_dim + head_offset;
+        value += score_head[t] * value_head[i];
+      }
+      output_head[i] = value;
+    }
   }
 }
 
