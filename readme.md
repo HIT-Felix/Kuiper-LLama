@@ -97,6 +97,7 @@ make -j16
 - 运行：
 ```shell
 ./build/demo/llama_infer Llama-3.2-1B.bin meta-llama/Llama-3.2-1B/tokenizer.json
+./build/demo/llama_infer Llama-3.2-1B.bin meta-llama/Llama-3.2-1B/tokenizer.json "Explain entropy in simple terms" 256
 # 和 huggingface 推理的结果进行对比
 python3 hf_infer/llama3_infer.py
 ```

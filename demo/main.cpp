@@ -1,6 +1,7 @@
 #include <base/base.h>
 #include <base/tick.h>
 #include <glog/logging.h>
+#include <cstdlib>
 #include "model/llama3.h"
 
 int32_t generate(const model::LLama2Model& model, const std::string& sentence, int total_steps,
@@ -25,7 +26,7 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
   }
 
   if (need_output) {
-    printf("%s ", model.decode(words).data());
+    printf("%s", model.decode(words).data());
     fflush(stdout);
   }
   return std::min(pos, total_steps);
@@ -33,12 +34,16 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
 
 
 int main(int argc, char* argv[]) {
-  if (argc != 3) {
-    LOG(INFO) << "Usage: ./demo checkpoint path tokenizer path";
+  if (argc < 3 || argc > 5) {
+    LOG(INFO) << "Usage: ./demo checkpoint_path tokenizer_path [prompt] [max_steps]";
     return -1;
   }
   const char* checkpoint_path = argv[1];  // e.g. out/model.bin
   const char* tokenizer_path = argv[2];
+  const std::string sentence =
+      argc >= 4 ? argv[3] : "hello";
+  const int total_steps = argc >= 5 ? std::atoi(argv[4]) : 128;
+  LOG_IF(FATAL, total_steps <= 0) << "The max_steps should be positive.";
 
   model::LLama2Model model(base::TokenizerType::kEncodeBpe, tokenizer_path,
     checkpoint_path, false);
@@ -46,12 +51,13 @@ int main(int argc, char* argv[]) {
   if (!init_status) {
     LOG(FATAL) << "The model init failed, the error code is: " << init_status.get_err_code();
   }
-  const std::string& sentence = "hello";
 
   auto start = std::chrono::steady_clock::now();
   printf("Generating...\n");
+  printf("Prompt: %s\n", sentence.c_str());
+  printf("Response: ");
   fflush(stdout);
-  int steps = generate(model, sentence, 128, true);
+  int steps = generate(model, sentence, total_steps, true);
   auto end = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration<double>(end - start).count();
   printf("\nsteps/s:%lf\n", static_cast<double>(steps) / duration);
